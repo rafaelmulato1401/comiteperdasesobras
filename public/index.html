@@ -6,6 +6,9 @@
 <title>INPASA – Apuração de Perdas e Sobras</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<!-- Firebase SDK (compat — funciona em HTML puro sem bundler) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=Barlow:wght@300;400;500;600&display=swap');
 :root{
@@ -425,9 +428,10 @@ table.excel tbody tr.row-geral-highlight td:first-child{background:#2456a4;color
   </div>
   <div class="header-right">
     <div class="period-badge" id="periodBadge">Sem dados</div>
+    <div id="syncStatus" style="display:none;align-items:center;gap:6px;background:rgba(21,128,61,.9);color:#fff;font-family:Barlow,sans-serif;font-size:12px;font-weight:600;padding:5px 12px;border-radius:20px;letter-spacing:.3px;"></div>
     <button class="btn-import" onclick="exportarPDF()" title="Exportar PDF" id="btnPDF" style="background:#e53e3e;display:none;">&#128438; PDF</button>
-    <button class="btn-icon" onclick="saveFullSession()" title="Salvar sessão">&#128190; Salvar</button>
-    <button class="btn-icon" onclick="document.getElementById('loadInput').click()" title="Carregar sessão">&#128194; Carregar</button>
+    <button class="btn-icon" onclick="saveFullSession()" title="Baixar backup JSON">&#128190; Backup</button>
+    <button class="btn-icon" onclick="document.getElementById('loadInput').click()" title="Carregar backup JSON">&#128194; Restaurar</button>
     <input type="file" id="loadInput" accept=".json" style="display:none" onchange="loadSessionFile(this)">
   </div>
 </header>
@@ -1093,6 +1097,36 @@ table.excel tbody tr.row-geral-highlight td:first-child{background:#2456a4;color
 var FILIAL_MAP={1:'Sinop',2:'Dourados',3:'Nova Mutum',6:'Sidrolândia',8:'Balsas',10:'Luis Eduardo',13:'Rio Verde',14:'Rondonópolis'};
 var LS_KEY='inpasa_sf_v4';
 
+// ═══════════════════════════════════════
+// FIREBASE INIT
+// ═══════════════════════════════════════
+var _fbApp=firebase.initializeApp({
+  apiKey:"AIzaSyB8U7Puqxx0azF1i2lGyfp49ww4D2l1FV4",
+  authDomain:"comiteperdasesobras-45bde.firebaseapp.com",
+  projectId:"comiteperdasesobras-45bde",
+  storageBucket:"comiteperdasesobras-45bde.firebasestorage.app",
+  messagingSenderId:"705157202445",
+  appId:"1:705157202445:web:a1f12d465ee809318d0b44"
+});
+var _db=firebase.firestore(_fbApp);
+var _docRef=_db.collection('sessao').doc('dados');
+var _syncTimer=null;
+var _syncPending=false;
+
+// Indicador de sync no header
+function showSyncStatus(status){
+  // status: 'saving' | 'saved' | 'error' | 'loading'
+  var el=document.getElementById('syncStatus');
+  if(!el) return;
+  var icons={saving:'⏳',saved:'☁️',error:'⚠️',loading:'🔄'};
+  var colors={saving:'rgba(240,165,0,.8)',saved:'rgba(21,128,61,.8)',error:'rgba(185,28,28,.8)',loading:'rgba(36,86,164,.8)'};
+  var labels={saving:'Salvando…',saved:'Sincronizado',error:'Erro ao salvar',loading:'Carregando…'};
+  el.textContent=icons[status]+' '+labels[status];
+  el.style.background=colors[status];
+  el.style.display='flex';
+  if(status==='saved') setTimeout(function(){if(el) el.style.display='none';},3000);
+}
+
 var DB=[], KEYS=new Set(), IMPORT_LOG=[];
 var TERMINALS=[]; // [{id, nome, sigla, tipo, obs}]
 var LANCAMENTOS=[]; // [{id, terminalId, mes, ano, ...}]
@@ -1108,6 +1142,10 @@ var descParsedBatch=[];// lote em processamento
 // Transportadoras de terminal a EXCLUIR
 var TRANSP_EXCLUIR=['TECIAP','ULTRACARGO','LOGUM','TEMAPE','INPASA',
   'TERMINAIS DE COMBUSTIVEL DE PAULINIA','CENTROESTE'];
+
+// Firebase state
+var _syncTimer=null;
+var _syncPending=false;
 
 // ═══════════════════════════════════════
 // UTILS
@@ -1659,37 +1697,91 @@ function updateDbBar(){
 // ═══════════════════════════════════════
 // SESSION SAVE / LOAD
 // ═══════════════════════════════════════
+function _buildPayload(){
+  return{v:'4',ts:new Date().toISOString(),
+    db:DB,keys:[...KEYS],log:IMPORT_LOG,
+    terminals:TERMINALS,lancamentos:LANCAMENTOS,
+    descDb:DESC_DB,descLog:DESC_LOG};
+}
+function _applyPayload(s){
+  var rows=s.db||[];var added=0;
+  rows.forEach(function(r){var k=r.key||(r.nr+'|'+r.cod+'|'+r.baia);r.key=k;if(!KEYS.has(k)){KEYS.add(k);DB.push(r);added++;}});
+  if(s.log) s.log.forEach(function(l){IMPORT_LOG.push(l);});
+  if(s.terminals) TERMINALS=s.terminals;
+  if(s.lancamentos) LANCAMENTOS=s.lancamentos;
+  if(s.descDb) DESC_DB=s.descDb;
+  if(s.descLog) DESC_LOG=s.descLog;
+  return added;
+}
+function showSyncStatus(status){
+  var el=document.getElementById('syncStatus');if(!el) return;
+  var icons={saving:'⏳',saved:'☁️',error:'⚠️',loading:'🔄'};
+  var colors={saving:'rgba(240,165,0,.9)',saved:'rgba(21,128,61,.9)',error:'rgba(185,28,28,.9)',loading:'rgba(36,86,164,.9)'};
+  var labels={saving:'Salvando…',saved:'Salvo na nuvem',error:'Erro ao salvar',loading:'Carregando…'};
+  el.textContent=icons[status]+' '+labels[status];
+  el.style.background=colors[status];el.style.display='flex';
+  if(status==='saved') setTimeout(function(){if(el) el.style.display='none';},3000);
+}
 function autoSave(){
-  try{localStorage.setItem(LS_KEY,JSON.stringify({v:'4',ts:new Date().toISOString(),db:DB,keys:[...KEYS],log:IMPORT_LOG,terminals:TERMINALS,lancamentos:LANCAMENTOS,descDb:DESC_DB,descLog:DESC_LOG}));}catch(e){}
+  // localStorage imediato
+  try{localStorage.setItem(LS_KEY,JSON.stringify(_buildPayload()));}catch(e){}
+  // Firestore com debounce 1.5s
+  _syncPending=true;
+  clearTimeout(_syncTimer);
+  _syncTimer=setTimeout(function(){
+    if(!_syncPending) return;
+    _syncPending=false;
+    showSyncStatus('saving');
+    _docRef.set(_buildPayload()).then(function(){
+      showSyncStatus('saved');
+    }).catch(function(err){
+      console.warn('Firestore save error:',err);
+      showSyncStatus('error');
+    });
+  },1500);
 }
 function saveFullSession(){
   if(!DB.length&&!TERMINALS.length&&!LANCAMENTOS.length&&!DESC_DB.length){toast('Sem dados para salvar.','err');return;}
-  var s={v:'4',ts:new Date().toISOString(),db:DB,keys:[...KEYS],log:IMPORT_LOG,terminals:TERMINALS,lancamentos:LANCAMENTOS,descDb:DESC_DB,descLog:DESC_LOG};
-  var blob=new Blob([JSON.stringify(s)],{type:'application/json'});
+  var blob=new Blob([JSON.stringify(_buildPayload())],{type:'application/json'});
   var url=URL.createObjectURL(blob);
-  var a=document.createElement('a');a.href=url;a.download='INPASA_PerdasSobras_'+new Date().toISOString().slice(0,10)+'.json';
+  var a=document.createElement('a');a.href=url;
+  a.download='INPASA_PerdasSobras_'+new Date().toISOString().slice(0,10)+'.json';
   document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
-  toast('Sessão salva!','ok');
+  toast('Backup baixado!','ok');
 }
 function loadSessionFile(input){
   var file=input.files[0];if(!file) return;
   var reader=new FileReader();
   reader.onload=function(e){
     try{
-      var s=JSON.parse(e.target.result);
-      var rows=s.db||[];var added=0;
-      rows.forEach(function(r){var k=r.key||(r.nr+'|'+r.cod+'|'+r.baia);r.key=k;if(!KEYS.has(k)){KEYS.add(k);DB.push(r);added++;}});
-      if(s.log) s.log.forEach(function(l){IMPORT_LOG.push(l);});
-      if(s.terminals) TERMINALS=s.terminals;
-      if(s.lancamentos) LANCAMENTOS=s.lancamentos;
-      if(s.descDb) DESC_DB=s.descDb;
-      if(s.descLog) DESC_LOG=s.descLog;
-      autoSave();renderSetagFilters();renderSeta();renderApres();renderLog();updateDbBar();renderTerminalList();
+      var added=_applyPayload(JSON.parse(e.target.result));
+      autoSave();
+      renderSetagFilters();renderSeta();renderApres();renderLog();updateDbBar();renderTerminalList();
       rebuildDescFilters();renderDescTable();updateDescBar();renderDescLog();
       toast(added+' Seta/Balança + '+DESC_DB.length+' descargas + '+TERMINALS.length+' terminais + '+LANCAMENTOS.length+' lançamentos carregados!','ok');
     }catch(err){toast('Erro: '+err.message,'err');}
     input.value='';
   };reader.readAsText(file);
+}
+function loadFromFirestore(onDone){
+  showSyncStatus('loading');
+  _docRef.get().then(function(doc){
+    if(doc.exists){
+      var s=doc.data();
+      _applyPayload(s);
+      try{localStorage.setItem(LS_KEY,JSON.stringify(s));}catch(e){}
+      showSyncStatus('saved');
+    } else {
+      var el=document.getElementById('syncStatus');if(el) el.style.display='none';
+    }
+    if(onDone) onDone();
+  }).catch(function(err){
+    console.warn('Firestore load error:',err);
+    showSyncStatus('error');
+    var raw=localStorage.getItem(LS_KEY);
+    if(raw){try{_applyPayload(JSON.parse(raw));}catch(e){}}
+    if(onDone) onDone();
+  });
 }
 function clearSetaData(){
   if(!confirm('Limpar todos os dados de Seta × Balança?')) return;
@@ -1707,6 +1799,8 @@ function clearAll(){
   if(!confirm('Limpar TODOS os dados (Seta/Balança, Descargas, terminais e lançamentos)?')) return;
   DB=[];KEYS=new Set();IMPORT_LOG=[];TERMINALS=[];LANCAMENTOS=[];DESC_DB=[];DESC_LOG=[];
   localStorage.removeItem(LS_KEY);
+  showSyncStatus('saving');
+  _docRef.delete().then(function(){showSyncStatus('saved');}).catch(function(){showSyncStatus('error');});
   renderSetagFilters();renderSeta();renderApres();renderLog();updateDbBar();renderTerminalList();
   updateDescBar();renderDescLog();renderDescTable();
   toast('Tudo limpo.');
@@ -2999,29 +3093,23 @@ function updatePDFButton(){
 }
 
 // ═══════════════════════════════════════
-// AUTO-RESTORE
+// AUTO-RESTORE — carrega do Firestore com fallback para localStorage
 // ═══════════════════════════════════════
-(function(){
-  var raw=localStorage.getItem(LS_KEY);if(!raw) return;
-  try{
-    var s=JSON.parse(raw);
-    var rows=s.db||[];
-    rows.forEach(function(r){var k=r.key||(r.nr+'|'+r.cod+'|'+r.baia);r.key=k;if(!KEYS.has(k)){KEYS.add(k);DB.push(r);}});
-    if(s.log) s.log.forEach(function(l){IMPORT_LOG.push(l);});
-    if(s.terminals) TERMINALS=s.terminals;
-    if(s.lancamentos) LANCAMENTOS=s.lancamentos;
-    if(s.descDb) DESC_DB=s.descDb;
-    if(s.descLog) DESC_LOG=s.descLog;
-    renderSetagFilters();renderSeta();renderApres();renderLog();updateDbBar();renderTerminalList();
-    rebuildDescFilters();renderDescTable();updateDescBar();renderDescLog();
-    if(DB.length||TERMINALS.length||DESC_DB.length) toast('Sessão restaurada: '+DB.length+' Seta/Balança · '+DESC_DB.length+' descargas · '+TERMINALS.length+' terminais · '+LANCAMENTOS.length+' lançamentos.','ok');
-  }catch(e){}
-})();
+loadFromFirestore(function(){
+  renderSetagFilters();renderSeta();renderApres();renderLog();updateDbBar();renderTerminalList();
+  rebuildDescFilters();renderDescTable();updateDescBar();renderDescLog();
+  if(DB.length||TERMINALS.length||DESC_DB.length){
+    toast('Sessão restaurada: '+DB.length+' Seta/Balança · '+DESC_DB.length+' descargas · '+TERMINALS.length+' terminais · '+LANCAMENTOS.length+' lançamentos.','ok');
+  }
+});
 
 // Página inicial = Apresentação
 showPage('p-apres');
 
-window.addEventListener('beforeunload',autoSave);
+// Firestore garante persistência — beforeunload apenas como fallback local
+window.addEventListener('beforeunload',function(){
+  try{localStorage.setItem(LS_KEY,JSON.stringify(_buildPayload()));}catch(e){}
+});
 </script>
 </body>
 </html>
