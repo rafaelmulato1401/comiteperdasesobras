@@ -1109,13 +1109,16 @@ var _fbApp=firebase.initializeApp({
   appId:"1:705157202445:web:a1f12d465ee809318d0b44"
 });
 var _db=firebase.firestore(_fbApp);
-var _docRef=_db.collection('sessao').doc('dados');
+// Firestore: múltiplos documentos para contornar limite de 1MB
+// doc 'meta'   → terminals, lancamentos, logs, keys (pequeno)
+// doc 'db_0', 'db_1', ... → DB em chunks de 800 registros
+// doc 'desc_0', 'desc_1', ... → DESC_DB em chunks de 800 registros
+var _col=_db.collection('sessao');
+var _CHUNK=800; // registros por documento
 var _syncTimer=null;
 var _syncPending=false;
 
-// Indicador de sync no header
 function showSyncStatus(status){
-  // status: 'saving' | 'saved' | 'error' | 'loading'
   var el=document.getElementById('syncStatus');
   if(!el) return;
   var icons={saving:'⏳',saved:'☁️',error:'⚠️',loading:'🔄'};
@@ -1713,33 +1716,67 @@ function _applyPayload(s){
   if(s.descLog) DESC_LOG=s.descLog;
   return added;
 }
-function showSyncStatus(status){
-  var el=document.getElementById('syncStatus');if(!el) return;
-  var icons={saving:'⏳',saved:'☁️',error:'⚠️',loading:'🔄'};
-  var colors={saving:'rgba(240,165,0,.9)',saved:'rgba(21,128,61,.9)',error:'rgba(185,28,28,.9)',loading:'rgba(36,86,164,.9)'};
-  var labels={saving:'Salvando…',saved:'Salvo na nuvem',error:'Erro ao salvar',loading:'Carregando…'};
-  el.textContent=icons[status]+' '+labels[status];
-  el.style.background=colors[status];el.style.display='flex';
-  if(status==='saved') setTimeout(function(){if(el) el.style.display='none';},3000);
+
+// ── Divide array em chunks de _CHUNK elementos ──
+function _chunk(arr){
+  var out=[];
+  for(var i=0;i<arr.length;i+=_CHUNK) out.push(arr.slice(i,i+_CHUNK));
+  return out.length?out:[[]];
 }
+
+// ── Salva todos os chunks de um prefixo, remove excedentes ──
+function _saveChunks(prefix,arr,batch){
+  var chunks=_chunk(arr);
+  chunks.forEach(function(c,i){
+    batch.set(_col.doc(prefix+'_'+i),{data:c,total:chunks.length});
+  });
+  return chunks.length;
+}
+
+// ── autoSave: localStorage imediato + Firestore chunked com debounce ──
 function autoSave(){
-  // localStorage imediato
   try{localStorage.setItem(LS_KEY,JSON.stringify(_buildPayload()));}catch(e){}
-  // Firestore com debounce 1.5s
   _syncPending=true;
   clearTimeout(_syncTimer);
   _syncTimer=setTimeout(function(){
     if(!_syncPending) return;
     _syncPending=false;
     showSyncStatus('saving');
-    _docRef.set(_buildPayload()).then(function(){
+    var batch=_db.batch();
+    // doc 'meta' — dados pequenos
+    batch.set(_col.doc('meta'),{
+      v:'4',ts:new Date().toISOString(),
+      keys:[...KEYS],log:IMPORT_LOG,
+      terminals:TERMINALS,lancamentos:LANCAMENTOS,
+      descLog:DESC_LOG,
+      dbChunks:_chunk(DB).length,
+      descChunks:_chunk(DESC_DB).length
+    });
+    // DB chunks
+    _saveChunks('db',DB,batch);
+    // DESC_DB chunks
+    _saveChunks('desc',DESC_DB,batch);
+    batch.commit().then(function(){
       showSyncStatus('saved');
     }).catch(function(err){
-      console.warn('Firestore save error:',err);
+      console.warn('Firestore save error:',err.message);
       showSyncStatus('error');
+      toast('Firestore: '+err.message.slice(0,60),'err');
     });
   },1500);
 }
+
+// ── Lê chunks de um prefixo ──
+function _loadChunks(prefix,total){
+  var promises=[];
+  for(var i=0;i<total;i++) promises.push(_col.doc(prefix+'_'+i).get());
+  return Promise.all(promises).then(function(docs){
+    var arr=[];
+    docs.forEach(function(d){if(d.exists)(d.data().data||[]).forEach(function(r){arr.push(r);});});
+    return arr;
+  });
+}
+
 function saveFullSession(){
   if(!DB.length&&!TERMINALS.length&&!LANCAMENTOS.length&&!DESC_DB.length){toast('Sem dados para salvar.','err');return;}
   var blob=new Blob([JSON.stringify(_buildPayload())],{type:'application/json'});
@@ -1765,18 +1802,34 @@ function loadSessionFile(input){
 }
 function loadFromFirestore(onDone){
   showSyncStatus('loading');
-  _docRef.get().then(function(doc){
-    if(doc.exists){
-      var s=doc.data();
-      _applyPayload(s);
-      try{localStorage.setItem(LS_KEY,JSON.stringify(s));}catch(e){}
-      showSyncStatus('saved');
-    } else {
+  _col.doc('meta').get().then(function(meta){
+    if(!meta.exists){
       var el=document.getElementById('syncStatus');if(el) el.style.display='none';
+      if(onDone) onDone();return;
     }
-    if(onDone) onDone();
+    var m=meta.data();
+    TERMINALS=m.terminals||[];LANCAMENTOS=m.lancamentos||[];
+    if(m.log) m.log.forEach(function(l){IMPORT_LOG.push(l);});
+    if(m.keys) m.keys.forEach(function(k){KEYS.add(k);});
+    DESC_LOG=m.descLog||[];
+    var dbN=m.dbChunks||0;
+    var descN=m.descChunks||0;
+    return Promise.all([
+      dbN>0?_loadChunks('db',dbN):Promise.resolve([]),
+      descN>0?_loadChunks('desc',descN):Promise.resolve([])
+    ]).then(function(results){
+      var dbRows=results[0],descRows=results[1];
+      dbRows.forEach(function(r){
+        var k=r.key||(r.nr+'|'+r.cod+'|'+r.baia);r.key=k;
+        if(!KEYS.has(k)){KEYS.add(k);DB.push(r);}
+      });
+      DESC_DB=descRows;
+      try{localStorage.setItem(LS_KEY,JSON.stringify(_buildPayload()));}catch(e){}
+      showSyncStatus('saved');
+      if(onDone) onDone();
+    });
   }).catch(function(err){
-    console.warn('Firestore load error:',err);
+    console.warn('Firestore load error:',err.message);
     showSyncStatus('error');
     var raw=localStorage.getItem(LS_KEY);
     if(raw){try{_applyPayload(JSON.parse(raw));}catch(e){}}
@@ -1799,8 +1852,12 @@ function clearAll(){
   if(!confirm('Limpar TODOS os dados (Seta/Balança, Descargas, terminais e lançamentos)?')) return;
   DB=[];KEYS=new Set();IMPORT_LOG=[];TERMINALS=[];LANCAMENTOS=[];DESC_DB=[];DESC_LOG=[];
   localStorage.removeItem(LS_KEY);
+  // Deleta todos os documentos conhecidos
   showSyncStatus('saving');
-  _docRef.delete().then(function(){showSyncStatus('saved');}).catch(function(){showSyncStatus('error');});
+  var batch=_db.batch();
+  ['meta'].forEach(function(d){batch.delete(_col.doc(d));});
+  for(var i=0;i<20;i++){batch.delete(_col.doc('db_'+i));batch.delete(_col.doc('desc_'+i));}
+  batch.commit().then(function(){showSyncStatus('saved');}).catch(function(){showSyncStatus('error');});
   renderSetagFilters();renderSeta();renderApres();renderLog();updateDbBar();renderTerminalList();
   updateDescBar();renderDescLog();renderDescTable();
   toast('Tudo limpo.');
