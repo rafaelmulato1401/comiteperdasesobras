@@ -1757,9 +1757,9 @@ function autoSave(){
     }
     _col.doc('meta').set({
       v:'4',ts:new Date().toISOString(),
-      keys:[...KEYS],log:IMPORT_LOG,
+      log:IMPORT_LOG.slice(-50),
       terminals:TERMINALS,lancamentos:LANCAMENTOS,
-      descLog:DESC_LOG,
+      descLog:DESC_LOG.slice(-50),
       dbChunks:dbChunks.length,
       descChunks:descChunks.length
     }).then(function(){
@@ -1820,7 +1820,6 @@ function loadFromFirestore(onDone){
     var m=meta.data();
     TERMINALS=m.terminals||[];LANCAMENTOS=m.lancamentos||[];
     if(m.log) m.log.forEach(function(l){IMPORT_LOG.push(l);});
-    if(m.keys) m.keys.forEach(function(k){KEYS.add(k);});
     DESC_LOG=m.descLog||[];
     var dbN=m.dbChunks||0;
     var descN=m.descChunks||0;
