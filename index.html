@@ -1733,7 +1733,8 @@ function _saveChunks(prefix,arr,batch){
   return chunks.length;
 }
 
-// ── autoSave: localStorage imediato + Firestore chunked com debounce ──
+// ── autoSave: localStorage imediato + Firestore por commits sequenciais ──
+// (evita limite de 10MB do batch e 1MB por documento)
 function autoSave(){
   try{localStorage.setItem(LS_KEY,JSON.stringify(_buildPayload()));}catch(e){}
   _syncPending=true;
@@ -1742,26 +1743,35 @@ function autoSave(){
     if(!_syncPending) return;
     _syncPending=false;
     showSyncStatus('saving');
-    var batch=_db.batch();
-    // doc 'meta' — dados pequenos
-    batch.set(_col.doc('meta'),{
+    var dbChunks=_chunk(DB);
+    var descChunks=_chunk(DESC_DB);
+    // Salva um documento por vez: meta, depois db_0..N, depois desc_0..N
+    function commitChunks(prefix,chunks,idx,onDone){
+      if(idx>=chunks.length){onDone();return;}
+      _col.doc(prefix+'_'+idx).set({data:chunks[idx],total:chunks.length})
+        .then(function(){commitChunks(prefix,chunks,idx+1,onDone);})
+        .catch(function(err){
+          console.warn('chunk err '+prefix+'_'+idx+':',err.message);
+          onDone();
+        });
+    }
+    _col.doc('meta').set({
       v:'4',ts:new Date().toISOString(),
       keys:[...KEYS],log:IMPORT_LOG,
       terminals:TERMINALS,lancamentos:LANCAMENTOS,
       descLog:DESC_LOG,
-      dbChunks:_chunk(DB).length,
-      descChunks:_chunk(DESC_DB).length
-    });
-    // DB chunks
-    _saveChunks('db',DB,batch);
-    // DESC_DB chunks
-    _saveChunks('desc',DESC_DB,batch);
-    batch.commit().then(function(){
-      showSyncStatus('saved');
+      dbChunks:dbChunks.length,
+      descChunks:descChunks.length
+    }).then(function(){
+      commitChunks('db',dbChunks,0,function(){
+        commitChunks('desc',descChunks,0,function(){
+          showSyncStatus('saved');
+        });
+      });
     }).catch(function(err){
-      console.warn('Firestore save error:',err.message);
+      console.warn('Firestore meta error:',err.message);
       showSyncStatus('error');
-      toast('Firestore: '+err.message.slice(0,60),'err');
+      toast('Firestore: '+err.message.slice(0,80),'err');
     });
   },1500);
 }
